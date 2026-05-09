@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Lisp
+*.fasl
+*.lx64fsl
+
+# OS
+.DS_Store
+Thumbs.db
