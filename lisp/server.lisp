@@ -4,6 +4,12 @@
 
 (in-package :macro-gym)
 
+;; Tighten compiler policy so expansions don't carry debug instrumentation
+;; and compile/load is fast — model-generated macros land in this server
+;; thousands of times per training run.
+(sb-ext:restrict-compiler-policy 'debug 0)
+(sb-ext:restrict-compiler-policy 'speed 3)
+
 ;;; --- Variable normalization for deterministic comparison ---
 
 (defun collect-lambda-list-vars (ll table)
@@ -107,6 +113,16 @@
 
 (defun install-macro (defmacro-form)
   "Eval the defmacro form and return the macro name."
+  ;; Pre-compile in a throwaway context first: catches malformed defmacro
+  ;; (unbalanced parens, undefined helpers, ill-typed forms) before any
+  ;; macro body would run during expansion. Signals an error on bad input
+  ;; that the outer handler-case turns into a -0.1 reward, not a hang.
+  (handler-case
+      (sb-ext:with-timeout 5
+        (compile nil `(lambda () ,defmacro-form)))
+    (sb-ext:timeout (c)
+      (declare (ignore c))
+      (error "install-macro: compile timeout (5s)")))
   (eval defmacro-form)
   (cadr defmacro-form))
 
@@ -124,7 +140,8 @@
         (dolist (pair tests)
           (let* ((input (car pair))
                  (expected (cdr pair))
-                 (actual (handler-case (macroexpand-1 input)
+                 (actual (handler-case (sb-ext:with-timeout 5 (macroexpand-1 input))
+                           (sb-ext:timeout (c) (declare (ignore c)) "ERROR: macroexpand-1 timeout (5s)")
                            (error (c) (format nil "ERROR: ~a" c))))
                  (normalized-expected (normalize-variables expected))
                  (normalized-actual (if (stringp actual) actual

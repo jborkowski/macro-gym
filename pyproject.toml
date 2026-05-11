@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "macro-gym"
+version = "0.2.0"
+description = "Gymnasium env for Common Lisp macro generation, scored against SBCL macroexpand"
+requires-python = ">=3.9"
+dependencies = ["gymnasium"]
+
+[tool.setuptools]
+packages = ["macro_gym"]

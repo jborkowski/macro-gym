@@ -136,8 +136,13 @@ class MacroEnv(gym.Env):
         # Strip whitespace, ensure it's a defmacro form
         action = action.strip()
 
-        sbcl = get_service()
-        result = sbcl.eval_macro(self.kata_id, action)
+        # Per-instance SBCL — each MacroEnv has its own subprocess so
+        # ThreadPoolExecutor in the reward fn can parallelise macro
+        # evaluation across the host's cores (was singleton, bottleneck).
+        if self._sbcl is None:
+            self._sbcl = SBCLService()
+            self._sbcl.start()
+        result = self._sbcl.eval_macro(self.kata_id, action)
 
         reward = float(result.get(":reward", 0.0))
         done = bool(result.get(":done", False))
@@ -175,7 +180,13 @@ class MacroEnv(gym.Env):
         return "\n".join(parts)
 
     def close(self):
-        shutdown_service()
+        # Per-instance teardown — only stop OUR SBCL, not the global one.
+        if self._sbcl is not None:
+            try:
+                self._sbcl.stop()
+            except Exception:
+                pass
+            self._sbcl = None
 
 
 # Register with gymnasium
