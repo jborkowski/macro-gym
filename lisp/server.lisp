@@ -451,6 +451,29 @@ nothing new gets evaluated that wasn't already evaluated successfully."
           (walk form))
       (error () nil))))
 
+(defun equal-modulo-symbol-package (a b)
+  "Like EQUAL, but symbols compare by SYMBOL-NAME alone.
+
+The CL reader / macroexpander can intern equally-named symbols into
+different packages depending on `*package*` at the call site:
+expanded output lands in the expander thread's `*package*` (often
+CL-USER), while the kata's reference expansion was read inside the
+kata package. Stock EQUAL says NIL on (cl-user::foo) vs (kata::foo),
+but they are semantically interchangeable for macro-expansion testing
+— this matches the F8 design already used by SEXP-SIMILARITY in
+ted.lisp's node-label.
+
+Strict atom equality is preserved for everything else (numbers,
+strings, characters, vectors, etc.). The walk handles dotted tails
+because CDR is recursed on directly."
+  (cond
+    ((and (symbolp a) (symbolp b))
+     (string= (symbol-name a) (symbol-name b)))
+    ((and (consp a) (consp b))
+     (and (equal-modulo-symbol-package (car a) (car b))
+          (equal-modulo-symbol-package (cdr a) (cdr b))))
+    (t (equal a b))))
+
 (defun run-tests (macro-name tests timeout-per-test)
   "Run each test case. Returns (values results passed total sim-scores).
 Catches per-test runtime errors (so one bad expansion doesn't void the
@@ -492,7 +515,8 @@ SIM-SCORES is a list (one entry per test, in original order) of:
              (normalized-actual (if (stringp actual) actual
                                     (normalize-variables actual)))
              (pass (and (not (stringp actual))
-                        (equal normalized-actual normalized-expected))))
+                        (equal-modulo-symbol-package
+                         normalized-actual normalized-expected))))
         (when pass (incf passed))
         (let ((sim (cond
                      ;; Expansion errored on this input — no tree to compare.
@@ -528,8 +552,9 @@ SIM-SCORES is a list (one entry per test, in original order) of:
                           (de (bounded-full-macroexpand
                                (car tail-e) timeout-per-test)))
                      (when (and da de
-                                (equal (normalize-variables da)
-                                       (normalize-variables de)))
+                                (equal-modulo-symbol-package
+                                 (normalize-variables da)
+                                 (normalize-variables de)))
                        (setf (getf r :pass) t)
                        (setf (getf r :upgraded) :deep-equal)
                        (setf (car tail-s) 1.0)

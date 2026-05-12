@@ -42,7 +42,7 @@ positive integer; returns NIL otherwise."
           (setf *max-ted-nodes* parsed)
           parsed)))))
 
-(defparameter *ted-formula-version* "ted-zs-v3-uninterned-by-name"
+(defparameter *ted-formula-version* "ted-zs-v4-equal-by-name"
   "Stable wire identifier for the TED formula. Trainers' loss curves
 will encode this — bump on any algorithm or label-scheme change.
 
@@ -58,7 +58,17 @@ SBCL's reader produced separate-object-per-`#:NAME`-token semantics on
 tests.lisp expected expansions, splitting one logical gensym across
 multiple :V slots and dropping sim from 1.0 to ~0.87 on otherwise
 structurally-identical kata pairs. Unlocks ~90 katas in cl-ds/_rejected
-and creative/_rejected pools.")
+and creative/_rejected pools.
+
+v4-equal-by-name: server.lisp's `pass` check now compares normalized
+forms via `equal-modulo-symbol-package`, which treats two symbols as
+equal when their `symbol-name`s match (regardless of `symbol-package`).
+Fixes the ~21 katas in the bug-sim-1-fail-0 bucket where the reference
+expansion's INTERN-derived symbols land in CL-USER while the kata's
+expected expansion (read inside the kata package) has the same names
+in the kata's package. Same fix is applied to the deep-equal upgrade
+check. The TED similarity function itself was already package-agnostic
+per F8 — this aligns the strict `pass` predicate with that design.")
 
 ;;; ============================================================
 ;;;   Node label / children (s-expression view)
