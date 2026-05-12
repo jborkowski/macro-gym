@@ -25,6 +25,7 @@ override the environment.
 
 from __future__ import annotations
 
+import atexit
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -365,12 +366,17 @@ def get_grader() -> MacroGrader:
     Reads ``MACRO_GYM_*`` env vars at first construction; subsequent calls
     return the same instance regardless of env-var changes. Call
     :func:`shutdown_grader` to reset.
+
+    The singleton is registered with :mod:`atexit` so its SBCL subprocesses
+    are reaped at interpreter shutdown even if the caller never calls
+    :func:`shutdown_grader` explicitly.
     """
     global _DEFAULT
     if _DEFAULT is None:
         with _DEFAULT_LOCK:
             if _DEFAULT is None:
                 _DEFAULT = MacroGrader()
+                atexit.register(shutdown_grader)
     return _DEFAULT
 
 

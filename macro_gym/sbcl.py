@@ -185,19 +185,7 @@ class SBCLProcess:
                 except subprocess.TimeoutExpired:
                     pass
         finally:
-            # Drain any stderr left over for diagnostics.
-            try:
-                if proc.stderr is not None:
-                    leftover = proc.stderr.read() or b""
-                    self._absorb_stderr(leftover)
-            except (OSError, ValueError):
-                pass
-            for stream in (proc.stdin, proc.stdout, proc.stderr):
-                try:
-                    if stream is not None:
-                        stream.close()
-                except (OSError, ValueError):
-                    pass
+            self._reap_streams(proc, drain_stderr=True)
 
     def kill(self) -> None:
         """Hard-kill the subprocess without waiting. Idempotent."""
@@ -213,6 +201,23 @@ class SBCLProcess:
             proc.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
             pass
+        self._reap_streams(proc, drain_stderr=False)
+
+    def _reap_streams(self, proc: subprocess.Popen, drain_stderr: bool) -> None:
+        """Close stdin/stdout/stderr on a dead/dying Popen so we don't leak FDs."""
+        if drain_stderr:
+            try:
+                if proc.stderr is not None:
+                    leftover = proc.stderr.read() or b""
+                    self._absorb_stderr(leftover)
+            except (OSError, ValueError):
+                pass
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
 
     # ----- IO --------------------------------------------------------------
 

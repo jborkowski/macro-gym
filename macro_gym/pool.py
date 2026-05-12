@@ -299,6 +299,7 @@ class SBCLPool:
         self._available: "queue.Queue[Worker]" = queue.Queue()
         self._all_workers: List[Worker] = []
         self._in_use: Set[Worker] = set()
+        self._restart_threads: Set[threading.Thread] = set()
         self._lock = threading.Lock()
         self._closed = False
         self._spawned = False
@@ -365,6 +366,12 @@ class SBCLPool:
             self._closed = True
             workers = list(self._all_workers)
             self._all_workers.clear()
+            pending = list(self._restart_threads)
+        # Wait for in-flight restarts so their freshly spawned SBCLs are
+        # captured by the close loop below — otherwise a daemon thread can
+        # race past us and leak the new subprocess.
+        for t in pending:
+            t.join(timeout=10.0)
         # Drain queue so future checkouts don't hand out a stale worker.
         try:
             while True:
@@ -450,25 +457,46 @@ class SBCLPool:
             name=f"sbcl-pool-restart-{worker.pid}",
             daemon=True,
         )
+        with self._lock:
+            self._restart_threads.add(t)
         t.start()
 
     def _restart_and_requeue(self, worker: Worker) -> None:
         try:
-            worker.restart()
-            with self._lock:
-                self._total_restarts += 1
-        except Exception as e:  # noqa: BLE001
-            log.error("Worker restart failed: %s", e, exc_info=True)
-            # If every worker is dead, future checkouts will raise
-            # PoolUnhealthyError via the checkout-path repair branch.
-            with self._lock:
-                if worker in self._all_workers and not any(
-                    w.alive() for w in self._all_workers
-                ):
-                    log.error("All workers dead; pool is unhealthy")
-            # Still re-queue so the checkout path can attempt to recover.
-        if not self._closed:
+            # If the pool was closed before we got scheduled, don't spawn a
+            # new SBCL — just tear the worker down.
+            if self._closed:
+                try:
+                    worker.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            try:
+                worker.restart()
+                with self._lock:
+                    self._total_restarts += 1
+            except Exception as e:  # noqa: BLE001
+                log.error("Worker restart failed: %s", e, exc_info=True)
+                # If every worker is dead, future checkouts will raise
+                # PoolUnhealthyError via the checkout-path repair branch.
+                with self._lock:
+                    if worker in self._all_workers and not any(
+                        w.alive() for w in self._all_workers
+                    ):
+                        log.error("All workers dead; pool is unhealthy")
+                # Still re-queue so the checkout path can attempt to recover.
+            if self._closed:
+                # close() raced past us between the check above and now;
+                # reap the freshly-spawned SBCL instead of leaking it.
+                try:
+                    worker.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
             self._available.put(worker)
+        finally:
+            with self._lock:
+                self._restart_threads.discard(threading.current_thread())
 
 
 def default_pool_size(env_size: Optional[int] = None) -> int:
