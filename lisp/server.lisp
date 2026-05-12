@@ -504,6 +504,11 @@ to signal clean shutdown."
            :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*))))
 
 (defun main ()
+  (let ((override (init-max-ted-nodes-from-env)))
+    (when override
+      (format *error-output*
+              "~&;; MACRO_GYM_MAX_TED_NODES override: *max-ted-nodes*=~d~%"
+              override)))
   (format *error-output* "~&;; macro-gym server v0.3 ready~%")
   (finish-output *error-output*)
   (loop

@@ -17,4 +17,5 @@
            :sexp-similarity
            :build-ted-tree
            :*max-ted-nodes*
-           :*ted-formula-version*))
+           :*ted-formula-version*
+           :init-max-ted-nodes-from-env))

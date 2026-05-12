@@ -24,8 +24,23 @@
 to similarity NIL rather than running O(n^3-4) Zhang-Shasha.
 Calibrated against the GRPO sanity dataset (cl-ds + creative-macros):
 a 100-node cap dropped three real katas to NIL; 200 covers them with
-~5-50 ms per grade in tight SBCL. Operators may shrink for safety if
-training reports slow grades — there's no env-var hook yet (TODO).")
+~5-50 ms per grade in tight SBCL.
+
+Operators override at SBCL boot via the MACRO_GYM_MAX_TED_NODES env var
+(positive integer). Read by INIT-MAX-TED-NODES-FROM-ENV, called from
+server.lisp's MAIN. Garbage / non-positive values are silently ignored
+and the default is preserved.")
+
+(defun init-max-ted-nodes-from-env ()
+  "Read MACRO_GYM_MAX_TED_NODES at SBCL startup. Returns the parsed
+override (and mutates *MAX-TED-NODES*) when the env var holds a
+positive integer; returns NIL otherwise."
+  (let ((env-val (sb-ext:posix-getenv "MACRO_GYM_MAX_TED_NODES")))
+    (when (and env-val (plusp (length env-val)))
+      (let ((parsed (ignore-errors (parse-integer env-val :junk-allowed nil))))
+        (when (and parsed (plusp parsed))
+          (setf *max-ted-nodes* parsed)
+          parsed)))))
 
 (defparameter *ted-formula-version* "ted-zs-v1"
   "Stable wire identifier for the TED formula. Trainers' loss curves

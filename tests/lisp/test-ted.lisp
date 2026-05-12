@@ -9,6 +9,9 @@
 ;;;   4. overflow guard:     *max-ted-nodes* short-circuits to NIL
 
 (in-package :cl-user)
+;; sb-posix gives us setenv/unsetenv — needed for the env-var-override
+;; test below. SBCL's sb-ext:posix-getenv is read-only.
+(require :sb-posix)
 (defpackage :macro-gym/test-ted
   (:use :cl :parachute :macro-gym))
 (in-package :macro-gym/test-ted)
@@ -101,3 +104,38 @@ two forms that differ only in gensym names."
          (b (macro-gym::normalize-variables `(let ((,g2 1)) ,g2))))
     (is = 1.0 (sexp-similarity a b)
         "post-normalisation, gensym-different forms must score 1.0")))
+
+(define-test (ted env-var-override)
+  "MACRO_GYM_MAX_TED_NODES override mutates *MAX-TED-NODES* on call.
+Garbage / non-positive values are ignored — operators can't accidentally
+disable the cap by typoing 'auto' or '-1' into their env."
+  (let ((saved-cap macro-gym:*max-ted-nodes*)
+        (saved-env (sb-ext:posix-getenv "MACRO_GYM_MAX_TED_NODES")))
+    (unwind-protect
+        (progn
+          ;; Valid positive integer: applied, returned.
+          (sb-posix:setenv "MACRO_GYM_MAX_TED_NODES" "500" 1)
+          (is = 500 (macro-gym:init-max-ted-nodes-from-env)
+              "valid override must return the parsed value")
+          (is = 500 macro-gym:*max-ted-nodes*
+              "valid override must update *max-ted-nodes*")
+          ;; Garbage string: silently ignored, default preserved.
+          (setf macro-gym:*max-ted-nodes* 200)
+          (sb-posix:setenv "MACRO_GYM_MAX_TED_NODES" "auto" 1)
+          (is eq nil (macro-gym:init-max-ted-nodes-from-env)
+              "garbage env value must return NIL")
+          (is = 200 macro-gym:*max-ted-nodes*
+              "garbage env value must NOT mutate *max-ted-nodes*")
+          ;; Non-positive: silently ignored.
+          (sb-posix:setenv "MACRO_GYM_MAX_TED_NODES" "-1" 1)
+          (is eq nil (macro-gym:init-max-ted-nodes-from-env)
+              "negative env value must return NIL")
+          (is = 200 macro-gym:*max-ted-nodes*)
+          ;; Empty env value: treated as absent.
+          (sb-posix:setenv "MACRO_GYM_MAX_TED_NODES" "" 1)
+          (is eq nil (macro-gym:init-max-ted-nodes-from-env)
+              "empty env value must be treated as absent"))
+      (setf macro-gym:*max-ted-nodes* saved-cap)
+      (if saved-env
+          (sb-posix:setenv "MACRO_GYM_MAX_TED_NODES" saved-env 1)
+          (sb-posix:unsetenv "MACRO_GYM_MAX_TED_NODES")))))
