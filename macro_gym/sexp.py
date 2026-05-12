@@ -7,14 +7,21 @@ import re
 from io import StringIO
 from typing import Any
 
+# Tokenizer notes:
+# - Parens are a separate token; fallback symbol stops at whitespace OR parens
+#   (was \S+ which greedily ate ")" — `t)` parsed as one symbol, breaking lists).
+# - Bare `t` and `nil` are recognized as boolean literals (Lisp truth values),
+#   but only when followed by whitespace, paren, or end-of-string — so symbols
+#   like `tmp` or `nil-foo` don't trigger them.
 _SEXP_RE = re.compile(r'''\s*(?:
-    ("(?:[^"\\]|\\.)*")|       # string
-    (:[a-zA-Z0-9_\-]+)|        # keyword
-    (-?\d+\.\d+)|              # float
-    (-?\d+)|                   # integer
-    (nil)\b|                   # nil
-    ([()])|                    # parens
-    (\S+)                      # fallback symbol
+    ("(?:[^"\\]|\\.)*")|       # 1 string
+    (:[a-zA-Z0-9_\-*?!+/]+)|   # 2 keyword (allow common CL keyword chars)
+    (-?\d+\.\d+)|              # 3 float
+    (-?\d+)(?![\w.])|          # 4 integer (not followed by word char or dot)
+    \bnil\b|                   # 5 nil (whole word)
+    \bt\b|                     # 6 t   (whole word)
+    ([()])|                    # 7 parens
+    ([^\s()]+)                 # 8 fallback symbol (stop at parens too)
 )''', re.VERBOSE)
 
 
@@ -29,12 +36,18 @@ def _tokenize(s: str) -> list[str]:
             tokens.append(float(m.group(3)))
         elif m.group(4):  # integer
             tokens.append(int(m.group(4)))
-        elif m.group(5):  # nil
-            tokens.append(None)
-        elif m.group(6):  # parens
+        elif m.group(5) is not None:  # parens
+            tokens.append(m.group(5))
+        elif m.group(6):  # fallback symbol
             tokens.append(m.group(6))
-        elif m.group(7):  # fallback symbol
-            tokens.append(m.group(7))
+        else:
+            # Either `nil` or `t` matched outside named groups — disambiguate by
+            # looking at the actual matched text.
+            tok = m.group(0).strip()
+            if tok == 'nil':
+                tokens.append(None)
+            elif tok == 't':
+                tokens.append(True)
     return tokens
 
 

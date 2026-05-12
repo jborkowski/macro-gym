@@ -1,16 +1,47 @@
+;;; server.lisp — macro-gym v0.3 verifier-first grader.
+;;;
+;;; Public contract (consumed by Python `macro_gym.sbcl.SBCLProcess`):
+;;;
+;;;   stdin:  one s-expression per request.
+;;;             (grade "kata-id" "macro-source-string")
+;;;             (eval-macro "kata-id" "macro-source-string")   ; legacy alias
+;;;             (:eof)                                          ; clean shutdown
+;;;
+;;;   stdout: length-prefixed UTF-8 plist responses:
+;;;             <decimal-byte-count>\n<payload>\n
+;;;
+;;; Safety surface:
+;;;   - `*read-eval* nil` + fresh `*readtable*` when reading hostile source
+;;;   - per-kata package isolation (symbols don't leak across katas)
+;;;   - bounded macroexpansion depth (default 64)
+;;;   - hard kill via `sb-thread:terminate-thread` on timeout
+;;;
+;;; This is NOT a capability sandbox — see docs/grader.md threat model.
+
 (defpackage :macro-gym
   (:use :cl)
-  (:export :main-loop))
+  (:export :main
+           :safe-read-macro
+           :normalize-variables
+           :evaluate-macro
+           :cached-load-kata
+           :respond-to-stream
+           :macro-gym-timeout
+           :*kata-cache*
+           :*max-macroexpand-depth*))
 
 (in-package :macro-gym)
 
-;; Tighten compiler policy so expansions don't carry debug instrumentation
-;; and compile/load is fast — model-generated macros land in this server
-;; thousands of times per training run.
+;; Tighten compiler policy: model-generated macros land here thousands of
+;; times per training run. Don't carry debug instrumentation; speed up the
+;; compile pass. Leave SAFETY at the default (>=1) so out-of-bounds and
+;; type errors signal cleanly rather than corrupt the worker.
 (sb-ext:restrict-compiler-policy 'debug 0)
 (sb-ext:restrict-compiler-policy 'speed 3)
 
-;;; --- Variable normalization for deterministic comparison ---
+;;; ============================================================
+;;;   Variable normalization (preserved verbatim — DO NOT EDIT)
+;;; ============================================================
 
 (defun collect-lambda-list-vars (ll table)
   "Extract variable names from a destructuring lambda list."
@@ -76,122 +107,399 @@
                  (t f))))
       (walk form))))
 
-;;; --- Kata loading ---
+;;; ============================================================
+;;;   Conditions
+;;; ============================================================
+
+(define-condition macro-gym-timeout (error)
+  ((message :initarg :message :initform "macroexpansion timeout" :reader macro-gym-timeout-message))
+  (:report (lambda (c s) (format s "~a" (macro-gym-timeout-message c)))))
+
+(define-condition macro-gym-depth-exceeded (error)
+  ((depth :initarg :depth :reader macro-gym-depth-exceeded-depth))
+  (:report (lambda (c s)
+             (format s "macroexpansion depth limit ~d exceeded"
+                     (macro-gym-depth-exceeded-depth c)))))
+
+;;; ============================================================
+;;;   Kata cache + per-kata package isolation
+;;; ============================================================
 
 (defstruct kata
   id
-  name
-  description
-  setup    ; list of forms to evaluate
-  tests)   ; alist: ((input . expected-expansion) ...)
+  package
+  setup-path
+  tests-path
+  tests
+  cache-mtime)
 
-(defun load-kata (kata-id)
-  "Load kata definition from katas/<id>/ directory."
-  (let* ((dir (format nil "katas/~a" kata-id))
-         (setup-path (format nil "~a/setup.lisp" dir))
-         (tests-path (format nil "~a/tests.lisp" dir)))
-    (unless (probe-file dir)
-      (error "Kata ~a not found at ~a" kata-id dir))
-    (make-kata
-     :id kata-id
-     :name kata-id
-     :setup (with-open-file (f setup-path)
-              (loop for form = (read f nil :eof)
-                    until (eq form :eof)
-                    collect form))
-     :tests (with-open-file (f tests-path)
-              (read f)))))
+(defvar *kata-cache* (make-hash-table :test #'equal)
+  "Maps kata-id (string) -> KATA struct. Keyed on id; the cached struct's
+CACHE-MTIME is compared on lookup. If files have changed since cache,
+the entry is invalidated and reloaded.")
 
-;;; --- Macro evaluation ---
+(defvar *kata-root* "katas/"
+  "Root directory under which kata definitions live. Each kata is a
+subdirectory containing setup.lisp and tests.lisp.")
+
+(defun kata-paths (kata-id)
+  "Returns (values setup-path tests-path). Signals an error if either is missing."
+  (let* ((dir (format nil "~a~a/" *kata-root* kata-id))
+         (setup-path (format nil "~asetup.lisp" dir))
+         (tests-path (format nil "~atests.lisp" dir)))
+    (unless (probe-file setup-path)
+      (error "Kata ~a: setup.lisp not found at ~a" kata-id setup-path))
+    (unless (probe-file tests-path)
+      (error "Kata ~a: tests.lisp not found at ~a" kata-id tests-path))
+    (values setup-path tests-path)))
+
+(defun kata-max-mtime (setup-path tests-path)
+  "File-write-date of the more-recently modified of the two files."
+  (max (or (file-write-date setup-path) 0)
+       (or (file-write-date tests-path) 0)))
+
+(defun kata-package-name (kata-id)
+  (format nil "KATA-~a" (string-upcase kata-id)))
+
+(defun ensure-kata-package (kata-id)
+  "Find or create the kata's package. Use :CL so kata code has the
+standard environment available, but symbols intern in the kata package."
+  (let ((name (kata-package-name kata-id)))
+    (or (find-package name)
+        (make-package name :use '(:cl)))))
+
+(defun load-setup-into-package (setup-path package)
+  "Re-read setup.lisp inside PACKAGE so freshly-encountered symbols
+intern in the kata package rather than :cl-user. Fresh readtable +
+*read-eval* nil for hostile-safety hygiene."
+  (let ((*package* package)
+        (*readtable* (copy-readtable nil))
+        (*read-eval* nil))
+    (with-open-file (f setup-path :direction :input)
+      (loop for form = (read f nil :eof)
+            until (eq form :eof)
+            do (let ((*read-eval* t))  ; allow eval of safely-read forms
+                 (eval form))))))
+
+(defun read-tests (tests-path package)
+  "Read the tests alist inside PACKAGE so symbols resolve consistently
+with setup.lisp (which also reads/interns inside the kata package).
+Fresh readtable + *read-eval* nil for hostile-safety."
+  (let ((*package* package)
+        (*readtable* (copy-readtable nil))
+        (*read-eval* nil))
+    (with-open-file (f tests-path :direction :input)
+      (read f))))
+
+(defun cached-load-kata (kata-id)
+  "Return a KATA struct. If cached and the files haven't changed, returns
+the cached instance (eq). Otherwise loads, caches, returns fresh."
+  (multiple-value-bind (setup-path tests-path) (kata-paths kata-id)
+    (let* ((mtime (kata-max-mtime setup-path tests-path))
+           (cached (gethash kata-id *kata-cache*)))
+      (when (and cached (eql (kata-cache-mtime cached) mtime))
+        (return-from cached-load-kata cached))
+      ;; Stale or absent — (re)load. Drop the old package if any, so
+      ;; setup-form re-evaluation doesn't trip "already defined" issues.
+      (when cached
+        (let ((old-pkg (kata-package cached)))
+          (when (and old-pkg (find-package old-pkg))
+            (ignore-errors (delete-package old-pkg)))))
+      (let* ((pkg (ensure-kata-package kata-id))
+             (k (make-kata :id kata-id
+                           :package pkg
+                           :setup-path setup-path
+                           :tests-path tests-path
+                           :cache-mtime mtime)))
+        (load-setup-into-package setup-path pkg)
+        (setf (kata-tests k) (read-tests tests-path pkg))
+        (setf (gethash kata-id *kata-cache*) k)
+        k))))
+
+;;; ============================================================
+;;;   Safe read + install
+;;; ============================================================
 
 (defun safe-read-macro (source)
-  "Read a defmacro form from source string, validate it."
-  (let ((form (with-input-from-string (s source) (read s))))
+  "Read a single defmacro form from SOURCE (a string). Defenses:
+   - *read-eval* nil blocks `#.(...)` RCE at read time.
+   - Fresh *readtable* blocks reader-macro persistence across calls.
+Signals an error if the form isn't a (defmacro ...)."
+  (let ((form (let ((*read-eval* nil)
+                    (*readtable* (copy-readtable nil)))
+                (with-input-from-string (s source)
+                  (read s)))))
     (unless (and (listp form) (eq (car form) 'defmacro))
-      (error "Expected (defmacro ...) form, got: ~a" (car form)))
+      (error "Expected (defmacro ...) form, got: ~s" (and (consp form) (car form))))
     form))
 
+(defun clear-kata-macros (kata-pkg)
+  "Unbind any defmacros that previously got installed in KATA-PKG. Required
+between grades: without this, a grade that installs `(defmacro broken ...)`
+would still see a `with-logging` macro definition left over from a previous
+grade, and tests against `with-logging` would silently use the stale
+definition — false positive reward."
+  (do-symbols (s kata-pkg)
+    (when (and (eq (symbol-package s) kata-pkg)
+               (macro-function s))
+      (fmakunbound s))))
+
 (defun install-macro (defmacro-form)
-  "Eval the defmacro form and return the macro name."
-  ;; Pre-compile in a throwaway context first: catches malformed defmacro
-  ;; (unbalanced parens, undefined helpers, ill-typed forms) before any
-  ;; macro body would run during expansion. Signals an error on bad input
-  ;; that the outer handler-case turns into a -0.1 reward, not a hang.
-  (handler-case
-      (sb-ext:with-timeout 5
-        (compile nil `(lambda () ,defmacro-form)))
-    (sb-ext:timeout (c)
-      (declare (ignore c))
-      (error "install-macro: compile timeout (5s)")))
+  "Eval the defmacro form, return the macro name. Errors propagate to
+the outer handler-case in evaluate-macro."
   (eval defmacro-form)
   (cadr defmacro-form))
 
-(defun evaluate-macro (kata-id macro-source)
-  "Core evaluation: compile macro, run on all test cases, return results."
-  (handler-case
-      (let* ((kata (load-kata kata-id))
-             (_ (dolist (form (kata-setup kata)) (eval form)))
-             (defmacro-form (safe-read-macro macro-source))
-             (macro-name (install-macro defmacro-form))
-             (tests (kata-tests kata))
-             (total (length tests))
-             (results nil)
-             (passed 0))
-        (dolist (pair tests)
-          (let* ((input (car pair))
-                 (expected (cdr pair))
-                 (actual (handler-case (sb-ext:with-timeout 5 (macroexpand-1 input))
-                           (sb-ext:timeout (c) (declare (ignore c)) "ERROR: macroexpand-1 timeout (5s)")
-                           (error (c) (format nil "ERROR: ~a" c))))
-                 (normalized-expected (normalize-variables expected))
-                 (normalized-actual (if (stringp actual) actual
-                                        (normalize-variables actual))))
-            (push (list :input (write-to-string input :pretty nil)
-                        :expected (write-to-string expected :pretty nil)
-                        :actual (if (stringp actual) actual
-                                    (write-to-string actual :pretty nil))
-                        :pass (equal normalized-actual normalized-expected))
-                  results)))
-        (setf results (nreverse results))
-        (setf passed (count-if (lambda (r) (getf r :pass)) results))
-        (let* ((fraction (if (zerop total) 0.0 (/ passed total)))
-               (done (= passed total))
-               (reward (cond
-                         ((= passed total) 1.0)
-                         ((> passed 0) (+ 0.1 (* 0.8 fraction)))
-                         (t 0.0))))
-          `(:reward ,reward :done ,done :passed ,passed :total ,total
-            :results ,results :error nil)))
-    (error (c)
-      `(:reward -0.1 :done nil :passed 0 :total 0
-        :results nil :error ,(format nil "~a" c)))))
+;;; ============================================================
+;;;   Bounded macroexpansion + hard timeout
+;;; ============================================================
 
-;;; --- Server loop ---
+(defvar *max-macroexpand-depth* 64
+  "Max nested macroexpansion steps before macroexpand-bounded errors.
+Defends against (defmacro foo () `(foo)) style infinite recursion.")
+
+(defun macroexpand-bounded (form)
+  "macroexpand-1 walking, bounded by *MAX-MACROEXPAND-DEPTH*. Stops when
+expansion fixpoints (form unchanged) — same shape as full macroexpand
+but with a hard upper bound on iterations."
+  (let ((current form))
+    (dotimes (depth *max-macroexpand-depth*
+              (error 'macro-gym-depth-exceeded :depth *max-macroexpand-depth*))
+      (multiple-value-bind (expanded expanded-p) (macroexpand-1 current)
+        (unless expanded-p
+          (return-from macroexpand-bounded current))
+        (setf current expanded)))))
+
+(defun expand-with-hard-timeout (input timeout-seconds)
+  "Run macroexpand-bounded on INPUT in a worker thread; kill the thread
+if it exceeds TIMEOUT-SECONDS. Returns the expansion or signals
+MACRO-GYM-TIMEOUT. `with-timeout` alone is unreliable against
+CPU-bound loops — terminate-thread is the belt to with-timeout's
+suspenders."
+  (let* ((result nil)
+         (err nil)
+         (thread (sb-thread:make-thread
+                  (lambda ()
+                    (handler-case
+                        (setf result (macroexpand-bounded input))
+                      (error (c) (setf err c))))
+                  :name "macro-gym-expander")))
+    (handler-case
+        (sb-ext:with-timeout timeout-seconds
+          (sb-thread:join-thread thread))
+      (sb-ext:timeout ()
+        (when (sb-thread:thread-alive-p thread)
+          (ignore-errors (sb-thread:terminate-thread thread)))
+        (error 'macro-gym-timeout
+               :message (format nil "macroexpansion exceeded ~as" timeout-seconds))))
+    (when err (error err))
+    result))
+
+;;; ============================================================
+;;;   Grading
+;;; ============================================================
+
+(defun safe-write-form (form)
+  "PRIN1 a form to string with stable settings. Used for the human-
+readable strings in :input/:expected/:actual fields. Disabling
+*print-circle* keeps the output free of `#1=` / `#1#` markers that
+would confuse downstream diffing."
+  (let ((*print-pretty* nil)
+        (*print-readably* nil)
+        (*print-case* :downcase)
+        (*print-circle* nil))
+    (write-to-string form :pretty nil :escape t)))
+
+(defun classify-error (c)
+  "Map a Lisp condition to an :error plist."
+  (let ((cls (string-downcase (symbol-name (type-of c)))))
+    (list :type (cond
+                  ((typep c 'macro-gym-timeout) "timeout")
+                  ((typep c 'macro-gym-depth-exceeded) "depth-exceeded")
+                  ((or (typep c 'reader-error)
+                       (typep c 'end-of-file))
+                   "read-error")
+                  ((typep c 'sb-ext:timeout) "timeout")
+                  ((or (typep c 'undefined-function)
+                       (typep c 'unbound-variable))
+                   "install-error")
+                  (t "evaluate-error"))
+          :message (handler-case (princ-to-string c)
+                     (error () "<unprintable condition>"))
+          :lisp-condition cls
+          :stderr-tail "")))
+
+(defun run-tests (macro-name tests timeout-per-test)
+  "Run each test case. Returns (values results passed total).
+Catches per-test runtime errors (so one bad expansion doesn't void the
+whole grade) but lets MACRO-GYM-TIMEOUT and MACRO-GYM-DEPTH-EXCEEDED
+propagate to the outer evaluate-macro handler — those mean the macro
+itself is pathological, not just wrong on one input, and the contract
+maps them to a global reward=-0.1."
+  (declare (ignore macro-name))
+  (let ((results nil)
+        (passed 0)
+        (total (length tests)))
+    (dolist (pair tests)
+      (let* ((input (car pair))
+             (expected (cdr pair))
+             (actual
+               (handler-case (expand-with-hard-timeout input timeout-per-test)
+                 ;; Let global pathologies propagate up.
+                 (macro-gym-timeout (c) (error c))
+                 (macro-gym-depth-exceeded (c) (error c))
+                 (error (c) (format nil "ERROR: ~a" c))))
+             (normalized-expected (normalize-variables expected))
+             (normalized-actual (if (stringp actual) actual
+                                    (normalize-variables actual)))
+             (pass (and (not (stringp actual))
+                        (equal normalized-actual normalized-expected))))
+        (when pass (incf passed))
+        (push (list :input (safe-write-form input)
+                    :expected (safe-write-form expected)
+                    :actual (if (stringp actual) actual (safe-write-form actual))
+                    :pass pass)
+              results)))
+    (values (nreverse results) passed total)))
+
+(defun reward-for (passed total)
+  (cond
+    ((zerop total) 0.0)
+    ((= passed total) 1.0)
+    ((> passed 0) (+ 0.1 (* 0.8 (/ passed total))))
+    (t 0.0)))
+
+(defun evaluate-macro (kata-id macro-source &key (per-test-timeout 5))
+  "Grade MACRO-SOURCE against the kata identified by KATA-ID. Returns
+a plist with :reward :passed :total :results :error :done :semantic-eq-score."
+  (handler-case
+      (let* ((kata (cached-load-kata kata-id))
+             ;; Bind *package* to the kata package for BOTH read and eval
+             ;; so the macro name (and any free symbols) intern in the
+             ;; same package the tests use.
+             (defmacro-form (let ((*package* (kata-package kata)))
+                              (safe-read-macro macro-source)))
+             ;; Per-grade reset: unbind macros installed by prior grades.
+             ;; Without this, a model that submits (defmacro broken ...) would
+             ;; pass tests against `with-logging` if a previous grade had
+             ;; installed a correct `with-logging`. See test_reward_fn_all_bad.
+             (_ (clear-kata-macros (kata-package kata)))
+             (macro-name (let ((*package* (kata-package kata)))
+                           (install-macro defmacro-form))))
+        (declare (ignore _))
+        (multiple-value-bind (results passed total)
+            (let ((*package* (kata-package kata)))
+              (run-tests macro-name (kata-tests kata) per-test-timeout))
+          (list :reward (reward-for passed total)
+                :passed passed
+                :total total
+                :results results
+                :error nil
+                :done (and (plusp total) (= passed total))
+                :semantic-eq-score nil)))
+    (macro-gym-timeout (c)
+      (list :reward -0.1 :passed 0 :total 0 :results nil
+            :error (classify-error c)
+            :done nil :semantic-eq-score nil))
+    (macro-gym-depth-exceeded (c)
+      (list :reward -0.1 :passed 0 :total 0 :results nil
+            :error (classify-error c)
+            :done nil :semantic-eq-score nil))
+    (error (c)
+      (list :reward -0.1 :passed 0 :total 0 :results nil
+            :error (classify-error c)
+            :done nil :semantic-eq-score nil))))
+
+;;; ============================================================
+;;;   Framed I/O
+;;; ============================================================
+
+(defun respond-to-stream (stream plist)
+  "Write PLIST to STREAM using length-prefixed framing:
+   <decimal-byte-count>\\n<UTF-8 payload>\\n
+Byte count is of the encoded payload, not the trailing newline.
+
+NOTE: *print-readably* is bound to NIL. With *print-readably* t SBCL
+emits strings as #A((N) base-char . \"...\") to preserve array
+specialization on re-read. That format is valid CL but our Python
+s-expression parser only handles plain \"...\" strings. *print-escape* t
+is enough for plist round-trip (keywords and quoted strings)."
+  (let* ((*print-pretty* nil)
+         (*print-readably* nil)
+         (*print-case* :downcase)
+         (*print-escape* t)
+         (*print-circle* nil)
+         (payload (write-to-string plist :pretty nil :escape t :readably nil))
+         (bytes (sb-ext:string-to-octets payload :external-format :utf-8)))
+    (format stream "~d~%" (length bytes))
+    (write-string payload stream)
+    (terpri stream)
+    (finish-output stream)))
 
 (defun respond (plist)
-  "Send plist response to stdout."
-  (let ((*print-case* :downcase))
-    (prin1 plist)
-    (terpri)
-    (finish-output)))
+  (respond-to-stream *standard-output* plist))
 
-(defun main-loop ()
-  "Read eval-macro requests from stdin, write responses to stdout."
-  (let ((*standard-input* *standard-input*)
-        (*standard-output* *standard-output*))
-    (loop
-      (let ((request (read *standard-input* nil :eof)))
-        (when (eq request :eof) (return))
-        (when (and (listp request) (eq (car request) 'eval-macro))
-          (let ((kata-id (second request))
-                (macro-source (third request)))
-            (respond (evaluate-macro kata-id macro-source))))))))
+;;; ============================================================
+;;;   Main loop
+;;; ============================================================
 
-;;; --- Entry point ---
+(defun dispatch-request (request)
+  "Handle a single parsed request. Returns the plist response, or :exit
+to signal clean shutdown."
+  (cond
+    ((eq request :eof) :exit)
+    ((and (listp request) (eq (car request) :eof)) :exit)
+    ((and (listp request)
+          (or (eq (car request) 'grade)
+              (eq (car request) 'eval-macro)))
+     (let ((kata-id (second request))
+           (macro-source (third request)))
+       (unless (stringp kata-id)
+         (return-from dispatch-request
+           (list :reward -0.1 :passed 0 :total 0 :results nil
+                 :error (list :type "protocol-error"
+                              :message "kata-id must be a string"
+                              :lisp-condition nil
+                              :stderr-tail "")
+                 :done nil :semantic-eq-score nil)))
+       (unless (stringp macro-source)
+         (return-from dispatch-request
+           (list :reward -0.1 :passed 0 :total 0 :results nil
+                 :error (list :type "protocol-error"
+                              :message "macro-source must be a string"
+                              :lisp-condition nil
+                              :stderr-tail "")
+                 :done nil :semantic-eq-score nil)))
+       (evaluate-macro kata-id macro-source)))
+    (t
+     (list :reward -0.1 :passed 0 :total 0 :results nil
+           :error (list :type "protocol-error"
+                        :message (format nil "unknown request shape: ~s"
+                                         (and (consp request) (car request)))
+                        :lisp-condition nil
+                        :stderr-tail "")
+           :done nil :semantic-eq-score nil))))
 
 (defun main ()
-  (format *error-output* "~&;; macro-gym server ready~%")
+  (format *error-output* "~&;; macro-gym server v0.3 ready~%")
   (finish-output *error-output*)
-  (main-loop))
+  (loop
+    (let* ((request (handler-case (read *standard-input* nil :eof)
+                      (error (c)
+                        (respond (list :reward -0.1 :passed 0 :total 0 :results nil
+                                       :error (classify-error c)
+                                       :done nil :semantic-eq-score nil))
+                        (return))))
+           (response (dispatch-request request)))
+      (when (eq response :exit) (return))
+      (respond response))))
 
-(main)
+;;; ============================================================
+;;;   Entry point (load-only aware)
+;;; ============================================================
+
+;; Tests load this file via run-tests.lisp WITHOUT spawning main. They
+;; set CL-USER::*MACRO-GYM-LOAD-ONLY* before LOAD; we honor it here.
+(unless (and (boundp 'cl-user::*macro-gym-load-only*)
+             (symbol-value 'cl-user::*macro-gym-load-only*))
+  (main))
