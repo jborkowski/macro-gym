@@ -45,8 +45,10 @@ grader is broken."
     (true (plusp (total r)) "Kata must have at least one test case.")
     (false (err r) "No error on happy path.")
     (true (getf r :done) ":done must be t on full pass.")
-    (is eq nil (getf r :semantic-eq-score)
-        ":semantic-eq-score is the v0.4 hook, always nil in v0.3.")))
+    (is = 1.0 (getf r :semantic-eq-score)
+        ":semantic-eq-score is 1.0 on a full pass (TED self-distance).")
+    (is equal "ted-zs-v1" (getf r :semantic-eq-formula)
+        ":semantic-eq-formula tags the algorithm version on every successful grade.")))
 
 ;;; ---- Syntax / read errors --------------------------------------------
 

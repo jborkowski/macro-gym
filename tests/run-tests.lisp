@@ -43,9 +43,14 @@
 ;; load-only entrypoint in lisp/server.lisp that the test runner can use.
 ;; Convention: setting *macro-gym-load-only* before loading suppresses (main).
 (defparameter cl-user::*macro-gym-load-only* t)
-(load (merge-pathnames "../lisp/server.lisp"
-                       (make-pathname
-                         :directory (pathname-directory *load-pathname*))))
+(let ((lisp-dir (merge-pathnames "../lisp/"
+                                 (make-pathname
+                                   :directory (pathname-directory *load-pathname*)))))
+  ;; Order matters: defpackage in package.lisp, then ted.lisp (defines
+  ;; *max-ted-nodes* + sexp-similarity used by server.lisp's run-tests),
+  ;; then the server itself.
+  (dolist (file '("package.lisp" "ted.lisp" "server.lisp"))
+    (load (merge-pathnames file lisp-dir))))
 
 ;; Load test files.
 (let ((test-dir (merge-pathnames "lisp/"
@@ -55,7 +60,8 @@
                   "test-safety.lisp"
                   "test-framing.lisp"
                   "test-kata-cache.lisp"
-                  "test-evaluate.lisp"))
+                  "test-evaluate.lisp"
+                  "test-ted.lisp"))
     (let ((path (merge-pathnames file test-dir)))
       (if (probe-file path)
           (load path)
@@ -71,7 +77,8 @@
                 :macro-gym/test-safety
                 :macro-gym/test-framing
                 :macro-gym/test-kata-cache
-                :macro-gym/test-evaluate))
+                :macro-gym/test-evaluate
+                :macro-gym/test-ted))
       (all-passed t))
   (dolist (suite suites)
     (when (find-package suite)

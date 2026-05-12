@@ -62,6 +62,7 @@ class Result(TypedDict, total=False):
     error: Optional[ErrorDetail]
     done: bool
     semantic_eq_score: Optional[float]
+    semantic_eq_formula: Optional[str]
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +141,9 @@ def _coerce_result(raw: dict, fallback_error: Optional[ErrorDetail] = None) -> R
     if "semantic_eq_score" in raw:
         val = raw["semantic_eq_score"]
         out["semantic_eq_score"] = None if val is None else float(val)
+    if "semantic_eq_formula" in raw:
+        val = raw["semantic_eq_formula"]
+        out["semantic_eq_formula"] = None if val is None else str(val)
     # Error field
     if fallback_error is not None:
         out["error"] = fallback_error

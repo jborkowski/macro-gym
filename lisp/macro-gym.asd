@@ -3,4 +3,6 @@
   :author "macro-gym"
   :license "MIT"
   :depends-on ()
-  :components ((:file "server")))
+  :components ((:file "package")
+               (:file "ted" :depends-on ("package"))
+               (:file "server" :depends-on ("ted"))))

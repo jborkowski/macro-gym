@@ -18,17 +18,14 @@
 ;;;
 ;;; This is NOT a capability sandbox — see docs/grader.md threat model.
 
-(defpackage :macro-gym
-  (:use :cl)
-  (:export :main
-           :safe-read-macro
-           :normalize-variables
-           :evaluate-macro
-           :cached-load-kata
-           :respond-to-stream
-           :macro-gym-timeout
-           :*kata-cache*
-           :*max-macroexpand-depth*))
+;; Load sibling sources so the bare `sbcl --script lisp/server.lisp`
+;; invocation (used by `macro_gym.sbcl.SBCLProcess`) still works end-to-end.
+;; The ASDF system in macro-gym.asd loads these in dependency order too.
+(let ((here (make-pathname
+             :defaults (or *load-pathname* *compile-file-pathname*
+                           (merge-pathnames "server.lisp")))))
+  (dolist (f '("package.lisp" "ted.lisp"))
+    (load (merge-pathnames f here))))
 
 (in-package :macro-gym)
 
@@ -330,16 +327,24 @@ would confuse downstream diffing."
           :stderr-tail "")))
 
 (defun run-tests (macro-name tests timeout-per-test)
-  "Run each test case. Returns (values results passed total).
+  "Run each test case. Returns (values results passed total sim-scores).
 Catches per-test runtime errors (so one bad expansion doesn't void the
 whole grade) but lets MACRO-GYM-TIMEOUT and MACRO-GYM-DEPTH-EXCEEDED
 propagate to the outer evaluate-macro handler — those mean the macro
 itself is pathological, not just wrong on one input, and the contract
-maps them to a global reward=-0.1."
+maps them to a global reward=-0.1.
+
+SIM-SCORES is a list (one entry per test, in original order) of:
+  - a single-float in [0,1]: structural TED similarity between the
+    normalised actual and normalised expected expansions
+  - NIL: tree above *MAX-TED-NODES* — TED skipped, no signal
+  - 0.0 specifically: the macroexpansion errored on this test input
+    (per design F6: model produced no tree, so distance is maximal)"
   (declare (ignore macro-name))
   (let ((results nil)
         (passed 0)
-        (total (length tests)))
+        (total (length tests))
+        (sim-scores nil))
     (dolist (pair tests)
       (let* ((input (car pair))
              (expected (cdr pair))
@@ -355,12 +360,29 @@ maps them to a global reward=-0.1."
              (pass (and (not (stringp actual))
                         (equal normalized-actual normalized-expected))))
         (when pass (incf passed))
+        (let ((sim (cond
+                     ;; Expansion errored on this input — no tree to compare.
+                     ((stringp actual) 0.0)
+                     ;; Identical post-normalisation: skip the work, it's 1.0.
+                     (pass 1.0)
+                     ;; Run TED. May return NIL if either tree exceeds the cap.
+                     (t (sexp-similarity normalized-actual
+                                          normalized-expected)))))
+          (push sim sim-scores))
         (push (list :input (safe-write-form input)
                     :expected (safe-write-form expected)
                     :actual (if (stringp actual) actual (safe-write-form actual))
                     :pass pass)
               results)))
-    (values (nreverse results) passed total)))
+    (values (nreverse results) passed total (nreverse sim-scores))))
+
+(defun aggregate-semantic-eq (sim-scores)
+  "Mean of non-NIL entries, or NIL if every entry is NIL. Returns a
+single-float so the wire output is consistent — Python parses it as
+Optional[float]."
+  (let ((vals (remove nil sim-scores)))
+    (when vals
+      (coerce (/ (reduce #'+ vals) (length vals)) 'single-float))))
 
 (defun reward-for (passed total)
   (cond
@@ -387,7 +409,7 @@ a plist with :reward :passed :total :results :error :done :semantic-eq-score."
              (macro-name (let ((*package* (kata-package kata)))
                            (install-macro defmacro-form))))
         (declare (ignore _))
-        (multiple-value-bind (results passed total)
+        (multiple-value-bind (results passed total sim-scores)
             (let ((*package* (kata-package kata)))
               (run-tests macro-name (kata-tests kata) per-test-timeout))
           (list :reward (reward-for passed total)
@@ -396,19 +418,20 @@ a plist with :reward :passed :total :results :error :done :semantic-eq-score."
                 :results results
                 :error nil
                 :done (and (plusp total) (= passed total))
-                :semantic-eq-score nil)))
+                :semantic-eq-score (aggregate-semantic-eq sim-scores)
+                :semantic-eq-formula *ted-formula-version*)))
     (macro-gym-timeout (c)
       (list :reward -0.1 :passed 0 :total 0 :results nil
             :error (classify-error c)
-            :done nil :semantic-eq-score nil))
+            :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*))
     (macro-gym-depth-exceeded (c)
       (list :reward -0.1 :passed 0 :total 0 :results nil
             :error (classify-error c)
-            :done nil :semantic-eq-score nil))
+            :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*))
     (error (c)
       (list :reward -0.1 :passed 0 :total 0 :results nil
             :error (classify-error c)
-            :done nil :semantic-eq-score nil))))
+            :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*))))
 
 ;;; ============================================================
 ;;;   Framed I/O
@@ -461,7 +484,7 @@ to signal clean shutdown."
                               :message "kata-id must be a string"
                               :lisp-condition nil
                               :stderr-tail "")
-                 :done nil :semantic-eq-score nil)))
+                 :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*)))
        (unless (stringp macro-source)
          (return-from dispatch-request
            (list :reward -0.1 :passed 0 :total 0 :results nil
@@ -469,7 +492,7 @@ to signal clean shutdown."
                               :message "macro-source must be a string"
                               :lisp-condition nil
                               :stderr-tail "")
-                 :done nil :semantic-eq-score nil)))
+                 :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*)))
        (evaluate-macro kata-id macro-source)))
     (t
      (list :reward -0.1 :passed 0 :total 0 :results nil
@@ -478,7 +501,7 @@ to signal clean shutdown."
                                          (and (consp request) (car request)))
                         :lisp-condition nil
                         :stderr-tail "")
-           :done nil :semantic-eq-score nil))))
+           :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*))))
 
 (defun main ()
   (format *error-output* "~&;; macro-gym server v0.3 ready~%")
@@ -488,7 +511,7 @@ to signal clean shutdown."
                       (error (c)
                         (respond (list :reward -0.1 :passed 0 :total 0 :results nil
                                        :error (classify-error c)
-                                       :done nil :semantic-eq-score nil))
+                                       :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*))
                         (return))))
            (response (dispatch-request request)))
       (when (eq response :exit) (return))
