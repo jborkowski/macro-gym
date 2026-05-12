@@ -5,4 +5,5 @@
   :depends-on ()
   :components ((:file "package")
                (:file "ted" :depends-on ("package"))
-               (:file "server" :depends-on ("ted"))))
+               (:file "macro-helpers")
+               (:file "server" :depends-on ("ted" "macro-helpers"))))

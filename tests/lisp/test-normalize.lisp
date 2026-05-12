@@ -58,3 +58,28 @@
   (let ((n (macro-gym::normalize-variables '(+ 1 2))))
     (is equal n '(+ 1 2)
         "Function call `+` must NOT be renamed — it's a free symbol.")))
+
+(define-test (normalize reader-duplicated-uninterned)
+  "v3 fix: when SBCL's reader parses literal `#:NAME` `#:NAME` tokens in
+   the same form, it produces SEPARATE uninterned-symbol objects with the
+   same print name. Pre-v3 these got DIFFERENT :V indices (EQ-keyed map);
+   v3 keys by NAME so reader-duplicated tokens collapse to ONE :V slot —
+   matching what macroexpand-1 produces when a defmacro binds a gensym
+   once and references it multiple times."
+  (let* ((expected-from-reader
+          ;; Simulate reader behavior: two distinct uninterned symbols
+          ;; with identical print name "G1".
+          (let ((sym-a (make-symbol "G1"))
+                (sym-b (make-symbol "G1")))
+            `(let ((,sym-a "x") (f ,sym-a))
+               (when (probe ,sym-b) (use ,sym-b)))))
+         (actual-from-expand
+          ;; Simulate macroexpand: ONE gensym, four EQ-shared references.
+          (let ((g (make-symbol "G1")))
+            `(let ((,g "x") (f ,g))
+               (when (probe ,g) (use ,g)))))
+         (n-expected (macro-gym::normalize-variables expected-from-reader))
+         (n-actual   (macro-gym::normalize-variables actual-from-expand)))
+    (is equal n-expected n-actual
+        "Reader-duplicated `#:G1` tokens must collapse to the same :V slot
+         as a macroexpand-1-shared single gensym referenced multiple times.")))

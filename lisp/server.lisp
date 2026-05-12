@@ -24,7 +24,7 @@
 (let ((here (make-pathname
              :defaults (or *load-pathname* *compile-file-pathname*
                            (merge-pathnames "server.lisp")))))
-  (dolist (f '("package.lisp" "ted.lisp"))
+  (dolist (f '("package.lisp" "ted.lisp" "macro-helpers.lisp"))
     (load (merge-pathnames f here))))
 
 (in-package :macro-gym)
@@ -37,8 +37,23 @@
 (sb-ext:restrict-compiler-policy 'speed 3)
 
 ;;; ============================================================
-;;;   Variable normalization (preserved verbatim — DO NOT EDIT)
+;;;   Variable normalization
 ;;; ============================================================
+;;;
+;;; History:
+;;;   v0.3–v0.4: gensyms keyed via #'eq in canon-map. Worked for
+;;;     macroexpand-1 output (ONE gensym object shared across uses) but
+;;;     broke when tests.lisp expected expansions contained multiple
+;;;     `#:NAME` tokens — SBCL's reader produces DISTINCT uninterned
+;;;     symbols per token, so reader-duplicated gensyms got split across
+;;;     multiple :V indices, dropping sim to ~0.87 for kata pairs that
+;;;     were structurally identical.
+;;;   v0.4+ (ted-zs-v3-uninterned-by-name): uninterned symbols keyed
+;;;     by NAME so reader-produced duplicates collapse to one :V slot.
+;;;     Binding-introduced (interned) variables still use EQ — that
+;;;     path was always correct. (gensym "FOO") increments the counter
+;;;     so distinct gensyms get distinct names, preserving the
+;;;     `gensym-collapse` test's intent.
 
 (defun collect-lambda-list-vars (ll table)
   "Extract variable names from a destructuring lambda list."
@@ -82,23 +97,38 @@
          (dolist (sub form) (mark-binding-vars sub table)))))))
 
 (defun normalize-variables (form)
-  "Replace gensyms AND let-binding variables with canonical :V1, :V2, ..."
+  "Replace gensyms AND let-binding variables with canonical :V1, :V2, ...
+
+   Uninterned symbols are canonicalized by NAME (not EQ-identity) so the
+   CL reader's separate-object-per-`#:NAME`-token semantics doesn't split
+   one logical gensym across multiple :V slots. Interned binding variables
+   still use EQ — that path is uniquely correct."
   (let ((counter 0)
-        (canon-map (make-hash-table :test #'eq))
-        (binding-vars (make-hash-table :test #'eq)))
+        (canon-map      (make-hash-table :test #'eq))     ; interned binding vars
+        (uninterned-map (make-hash-table :test #'equal))  ; gensyms by NAME
+        (binding-vars   (make-hash-table :test #'eq)))
     (mark-binding-vars form binding-vars)
     (labels ((gensym-p (s)
                (and (symbolp s)
                     (not (keywordp s))
                     (null (symbol-package s))))
+             (canonical (sym)
+               (cond
+                 ((gensym-p sym)
+                  (or (gethash (symbol-name sym) uninterned-map)
+                      (setf (gethash (symbol-name sym) uninterned-map)
+                            (intern (format nil "V~d" (incf counter))
+                                    :keyword))))
+                 ((gethash sym binding-vars)
+                  (or (gethash sym canon-map)
+                      (setf (gethash sym canon-map)
+                            (intern (format nil "V~d" (incf counter))
+                                    :keyword))))
+                 (t sym)))
              (walk (f)
                (cond
-                 ((and (symbolp f)
-                       (not (keywordp f))
-                       (or (gensym-p f) (gethash f binding-vars)))
-                  (or (gethash f canon-map)
-                      (setf (gethash f canon-map)
-                            (intern (format nil "V~d" (incf counter)) :keyword))))
+                 ((and (symbolp f) (not (keywordp f)))
+                  (canonical f))
                  ((consp f)
                   (cons (walk (car f)) (walk (cdr f))))
                  (t f))))
@@ -182,11 +212,14 @@ template still produces a valid path."
   (format nil "KATA-~a" (string-upcase kata-id)))
 
 (defun ensure-kata-package (kata-id)
-  "Find or create the kata's package. Use :CL so kata code has the
-standard environment available, but symbols intern in the kata package."
+  "Find or create the kata's package. Uses :CL for the standard
+environment and :MACRO-GYM/MACRO-HELPERS so kata reference defmacros
+can call `with-gensyms`, `once-only`, `with-unique-names` at expansion
+time without each setup.lisp having to stub them locally. Symbols
+defined by the kata still intern into the kata package."
   (let ((name (kata-package-name kata-id)))
     (or (find-package name)
-        (make-package name :use '(:cl)))))
+        (make-package name :use '(:cl :macro-gym/macro-helpers)))))
 
 (defun load-setup-into-package (setup-path package)
   "Re-read setup.lisp inside PACKAGE so freshly-encountered symbols

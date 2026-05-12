@@ -42,7 +42,7 @@ positive integer; returns NIL otherwise."
           (setf *max-ted-nodes* parsed)
           parsed)))))
 
-(defparameter *ted-formula-version* "ted-zs-v2-err-shaped"
+(defparameter *ted-formula-version* "ted-zs-v3-uninterned-by-name"
   "Stable wire identifier for the TED formula. Trainers' loss curves
 will encode this — bump on any algorithm or label-scheme change.
 
@@ -50,7 +50,15 @@ v2-err-shaped: v1 algorithm unchanged; downstream reward shaping in
 server.lisp now buckets -0.1 errors into -0.03/-0.05/-0.07/-0.10 by
 error type, and rescues partial-pass rollouts via bounded-full-
 macroexpand deep-equal. The TED metric itself didn't move, but the
-sim → reward path did — bump version so wandb separates the runs.")
+sim → reward path did — bump version so wandb separates the runs.
+
+v3-uninterned-by-name: `normalize-variables` now keys uninterned
+symbols (gensyms) by NAME instead of EQ-identity. Fixes the case where
+SBCL's reader produced separate-object-per-`#:NAME`-token semantics on
+tests.lisp expected expansions, splitting one logical gensym across
+multiple :V slots and dropping sim from 1.0 to ~0.87 on otherwise
+structurally-identical kata pairs. Unlocks ~90 katas in cl-ds/_rejected
+and creative/_rejected pools.")
 
 ;;; ============================================================
 ;;;   Node label / children (s-expression view)

@@ -47,7 +47,7 @@ grader is broken."
     (true (getf r :done) ":done must be t on full pass.")
     (is = 1.0 (getf r :semantic-eq-score)
         ":semantic-eq-score is 1.0 on a full pass (TED self-distance).")
-    (is equal "ted-zs-v1" (getf r :semantic-eq-formula)
+    (is equal macro-gym::*ted-formula-version* (getf r :semantic-eq-formula)
         ":semantic-eq-formula tags the algorithm version on every successful grade.")))
 
 ;;; ---- Syntax / read errors --------------------------------------------
