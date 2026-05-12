@@ -49,7 +49,19 @@ print(grader.grade("with-logging", src))  # {'reward': ..., 'passed': ..., ...}
 
 Variables are structurally normalized (`let` / `handler-case` / `destructuring-bind` bindings → `:V1`, `:V2`), so reward measures structural correctness, not variable naming.
 
-Reward scale: `-0.1` syntax error · `0.0` no expansions match · `0.1`–`0.9` partial · `1.0` all correct.
+Reward scale (granular error shaping, v0.4):
+
+| reward         | meaning                                                    |
+| -------------- | ---------------------------------------------------------- |
+| `-0.10`        | no defmacro emitted · timeout · depth-exceeded · protocol  |
+| `-0.07`        | read-error (parens/syntax broke the reader)                |
+| `-0.05`        | install-error (undefined name in macro body)               |
+| `-0.03`        | evaluate-error (expanded but threw at expand time)         |
+| `0.00`         | compiled, but no test passed                               |
+| `0.10` – `0.90`| partial pass (`0.1 + 0.8 · passed/total`)                  |
+| `1.00`         | all tests pass (or pass after deep-macroexpand equivalence)|
+
+Errors stay distinguishable in `Result["error"]["type"]` — the granular reward is the trainer-visible mirror.
 
 ## GRPO integration
 

@@ -58,9 +58,28 @@ grader.close()
 - `examples/agent.py --show-solution` runs unchanged against shipped
   katas.
 - Kata format (`setup.lisp` + `tests.lisp`) is unchanged.
-- Reward scale (`-0.1` / `0.0` / partial / `1.0`) is unchanged.
 - The Gymnasium contract for `MacroEnv.reset` / `step` / `render` /
   `close` is preserved.
+
+## Changed in v0.4 (granular error rewards)
+
+- Negative reward range expanded from a flat `-0.1` to a four-bucket
+  scale: `-0.10` / `-0.07` / `-0.05` / `-0.03`. The bucket is computed
+  from the existing `Result["error"]["type"]` — no schema change.
+- `(defun ...)` style "didn't even try" rollouts now classify as
+  `error.type = "no-defmacro"` (was a generic string before).
+- Failing per-test cases may upgrade to passed via a bounded
+  deep-`macroexpand` semantic-equivalence check, gated on at-least-one
+  test already passing. Affected results carry `:upgraded "deep-equal"`
+  in the per-test plist.
+- Two new env-var overrides: `MACRO_GYM_KATA_ROOT` (kata search root)
+  and the previously-shipped `MACRO_GYM_MAX_TED_NODES`.
+
+Trainer migration: nothing — `reward` stays a float in
+`[-0.10, 1.00]`, `Result` keys are unchanged, and `error.type`
+strings are stable. The negative-side distribution will SHIFT
+(roughly half of the prior `-0.1` mass moves to `-0.07` and `-0.05`
+on real GRPO runs).
 
 ## Removed
 
