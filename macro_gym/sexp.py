@@ -74,15 +74,33 @@ def parse(s: str) -> Any:
     -> {':reward': 0.8, ':done': None, ':error': 'msg'}
 
     Returns the first complete s-expression found.
+
+    Auto-plist coercion only fires when the top-level form LOOKS like a
+    plist — keyword keys, even length. Without the guard we crashed on
+    bare nested forms like ``(let ((x 1)) x)`` because nested lists
+    are unhashable as dict keys (the per-test `:expected`/`:actual`
+    strings emitted by the grader hit this regularly).
     """
     tokens = _tokenize(s)
     if not tokens:
         return None
-    # Convert top-level list to dict if it looks like a plist
     result, _ = _parse_list(tokens, 0)
-    if len(result) == 1 and isinstance(result[0], list):
+    if (len(result) == 1
+            and isinstance(result[0], list)
+            and _looks_like_plist(result[0])):
         return _plist_to_dict(result[0])
     return result
+
+
+def _looks_like_plist(lst: list) -> bool:
+    """A plist has even length and keyword keys in even positions.
+    Conservative — only matches the wire shape the grader emits."""
+    if not lst or len(lst) % 2 != 0:
+        return False
+    return all(
+        isinstance(lst[i], str) and lst[i].startswith(":")
+        for i in range(0, len(lst), 2)
+    )
 
 
 def plist_to_dict(plist: list) -> dict:
