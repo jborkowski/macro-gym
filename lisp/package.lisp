@@ -10,6 +10,11 @@
            :cached-load-kata
            :respond-to-stream
            :macro-gym-timeout
+           :macro-gym-no-defmacro
+           :error-reward-for-type
+           :bounded-full-macroexpand
+           :*kata-root*
+           :init-kata-root-from-env
            :*kata-cache*
            :*max-macroexpand-depth*
            ;; TED public surface

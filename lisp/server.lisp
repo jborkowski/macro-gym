@@ -118,6 +118,12 @@
              (format s "macroexpansion depth limit ~d exceeded"
                      (macro-gym-depth-exceeded-depth c)))))
 
+(define-condition macro-gym-no-defmacro (error)
+  ((head :initarg :head :initform nil :reader macro-gym-no-defmacro-head))
+  (:report (lambda (c s)
+             (format s "Expected (defmacro ...) form, got: ~s"
+                     (macro-gym-no-defmacro-head c)))))
+
 ;;; ============================================================
 ;;;   Kata cache + per-kata package isolation
 ;;; ============================================================
@@ -137,7 +143,24 @@ the entry is invalidated and reloaded.")
 
 (defvar *kata-root* "katas/"
   "Root directory under which kata definitions live. Each kata is a
-subdirectory containing setup.lisp and tests.lisp.")
+subdirectory containing setup.lisp and tests.lisp.
+
+Operators override at SBCL boot via the MACRO_GYM_KATA_ROOT env var
+(absolute or relative path). Read by INIT-KATA-ROOT-FROM-ENV, called
+from MAIN. The override is appended with a trailing '/' if missing.")
+
+(defun init-kata-root-from-env ()
+  "Read MACRO_GYM_KATA_ROOT at SBCL startup. Returns the resolved path
+(and mutates *KATA-ROOT*) when the env var is non-empty; returns NIL
+otherwise. Trailing slash is added if absent so KATA-PATHS' FORMAT
+template still produces a valid path."
+  (let ((env-val (sb-ext:posix-getenv "MACRO_GYM_KATA_ROOT")))
+    (when (and env-val (plusp (length env-val)))
+      (let ((resolved (if (eql #\/ (char env-val (1- (length env-val))))
+                          env-val
+                          (concatenate 'string env-val "/"))))
+        (setf *kata-root* resolved)
+        resolved))))
 
 (defun kata-paths (kata-id)
   "Returns (values setup-path tests-path). Signals an error if either is missing."
@@ -221,13 +244,16 @@ the cached instance (eq). Otherwise loads, caches, returns fresh."
   "Read a single defmacro form from SOURCE (a string). Defenses:
    - *read-eval* nil blocks `#.(...)` RCE at read time.
    - Fresh *readtable* blocks reader-macro persistence across calls.
-Signals an error if the form isn't a (defmacro ...)."
+Signals MACRO-GYM-NO-DEFMACRO if the form isn't a (defmacro ...) — the
+distinct condition lets CLASSIFY-ERROR bucket 'model didn't even try'
+separately from 'syntax error inside a defmacro body'."
   (let ((form (let ((*read-eval* nil)
                     (*readtable* (copy-readtable nil)))
                 (with-input-from-string (s source)
                   (read s)))))
     (unless (and (listp form) (eq (car form) 'defmacro))
-      (error "Expected (defmacro ...) form, got: ~s" (and (consp form) (car form))))
+      (error 'macro-gym-no-defmacro
+             :head (and (consp form) (car form))))
     form))
 
 (defun clear-kata-macros (kata-pkg)
@@ -308,9 +334,12 @@ would confuse downstream diffing."
     (write-to-string form :pretty nil :escape t)))
 
 (defun classify-error (c)
-  "Map a Lisp condition to an :error plist."
+  "Map a Lisp condition to an :error plist. The :type string is the
+public signal that drives ERROR-REWARD-FOR-TYPE — keep the bucket names
+stable across versions."
   (let ((cls (string-downcase (symbol-name (type-of c)))))
     (list :type (cond
+                  ((typep c 'macro-gym-no-defmacro) "no-defmacro")
                   ((typep c 'macro-gym-timeout) "timeout")
                   ((typep c 'macro-gym-depth-exceeded) "depth-exceeded")
                   ((or (typep c 'reader-error)
@@ -326,6 +355,69 @@ would confuse downstream diffing."
           :lisp-condition cls
           :stderr-tail "")))
 
+(defun error-reward-for-type (type-string)
+  "Granular reward shaping for global errors. Wider negative range gives
+GRPO a usable gradient on the ~50% of rollouts that today flatten to
+-0.1. Ordering reflects how close the rollout came to a working macro:
+
+  no-defmacro     -0.10  model didn't emit a defmacro at all
+  timeout         -0.10  pathological (model wrote an infinite loop)
+  depth-exceeded  -0.10  pathological (self-recursive expansion)
+  protocol-error  -0.10  not really model-attributable
+  read-error      -0.07  malformed syntax inside a defmacro form
+  install-error   -0.05  body references undefined name (compiled-ish)
+  evaluate-error  -0.03  expanded but threw at macroexpand time
+  (default)       -0.10  unknown — stay conservative
+
+Ranges intentionally span 0.07 so PPO/GRPO advantage normalisation has
+enough variance to lift a partial-credit rollout above an unrelated
+crash. Keep these values pinned — every reward-shape change MUST bump
+:semantic-eq-formula and the README reward table."
+  (cond
+    ((null type-string) -0.10)
+    ((string= type-string "read-error")     -0.07)
+    ((string= type-string "install-error")  -0.05)
+    ((string= type-string "evaluate-error") -0.03)
+    (t -0.10)))
+
+(defun bounded-full-macroexpand (form timeout-seconds)
+  "Recursively macroexpand FORM into its fully-expanded normal form,
+walking through cons cells (cars get expanded, dotted tails too). Each
+expansion step is bounded by *MAX-MACROEXPAND-DEPTH* and the whole walk
+runs inside a hard wall-clock timeout via EXPAND-WITH-HARD-TIMEOUT.
+
+Returns the normal form on success, or NIL on timeout/depth-exceeded /
+any other error. Used by the deep-equal upgrade in RUN-TESTS — never
+re-runs the *model's source*: operates only on the already-expanded
+forms RUN-TESTS just captured (so attacker-controlled macro bodies
+never re-execute here). Macro lookups still hit the kata package's
+symbol table; that's intentional — we expand whatever's in the
+already-recorded expansion until it bottoms out in CL primitives.
+
+Bounded by the same depth cap that protected RUN-TESTS' first pass, so
+nothing new gets evaluated that wasn't already evaluated successfully."
+  (labels ((walk (f)
+             (cond
+               ((atom f) f)
+               (t
+                ;; Expand the head form first, then recurse into children.
+                (let ((expanded (macroexpand-bounded f)))
+                  (cond
+                    ((atom expanded) expanded)
+                    (t
+                     ;; Walk the cons spine; keep dotted tails intact.
+                     (loop with head = nil
+                           for tail = expanded then (cdr tail)
+                           while (consp tail)
+                           collect (walk (car tail)) into acc
+                           finally (return (if (null tail)
+                                               (nconc acc nil)
+                                               (nconc acc (walk tail))))))))))))
+    (handler-case
+        (sb-ext:with-timeout timeout-seconds
+          (walk form))
+      (error () nil))))
+
 (defun run-tests (macro-name tests timeout-per-test)
   "Run each test case. Returns (values results passed total sim-scores).
 Catches per-test runtime errors (so one bad expansion doesn't void the
@@ -333,6 +425,13 @@ whole grade) but lets MACRO-GYM-TIMEOUT and MACRO-GYM-DEPTH-EXCEEDED
 propagate to the outer evaluate-macro handler — those mean the macro
 itself is pathological, not just wrong on one input, and the contract
 maps them to a global reward=-0.1.
+
+After the first pass, any test that didn't pass gets one chance at a
+deep-macroexpand semantic-equivalence upgrade — see
+BOUNDED-FULL-MACROEXPAND. The upgrade is gated on first-pass
+PASSED > 0 (so a kata where no test passes can't get a spurious +1.0
+from two trees that happen to both deep-expand to the same wrong form).
+Upgrades set :pass to T, the per-test sim to 1.0, and increment PASSED.
 
 SIM-SCORES is a list (one entry per test, in original order) of:
   - a single-float in [0,1]: structural TED similarity between the
@@ -344,7 +443,9 @@ SIM-SCORES is a list (one entry per test, in original order) of:
   (let ((results nil)
         (passed 0)
         (total (length tests))
-        (sim-scores nil))
+        (sim-scores nil)
+        (raw-actuals nil)     ; parallel to results, :error if expansion threw
+        (raw-expecteds nil))
     (dolist (pair tests)
       (let* ((input (car pair))
              (expected (cdr pair))
@@ -369,12 +470,38 @@ SIM-SCORES is a list (one entry per test, in original order) of:
                      (t (sexp-similarity normalized-actual
                                           normalized-expected)))))
           (push sim sim-scores))
+        (push (if (stringp actual) :error actual) raw-actuals)
+        (push expected raw-expecteds)
         (push (list :input (safe-write-form input)
                     :expected (safe-write-form expected)
                     :actual (if (stringp actual) actual (safe-write-form actual))
                     :pass pass)
               results)))
-    (values (nreverse results) passed total (nreverse sim-scores))))
+    (let ((results-vec (nreverse results))
+          (sim-vec (nreverse sim-scores))
+          (acts (nreverse raw-actuals))
+          (exps (nreverse raw-expecteds)))
+      ;; Deep-equal upgrade pass — gate on at-least-one-pass to defend
+      ;; against two-degenerate-trees-converging-to-same-form. Eng F8.
+      (when (and (plusp passed) (< passed total))
+        (loop for tail-r on results-vec
+              for tail-s on sim-vec
+              for tail-a on acts
+              for tail-e on exps
+              for r = (car tail-r)
+              do (unless (or (getf r :pass) (eq (car tail-a) :error))
+                   (let* ((da (bounded-full-macroexpand
+                               (car tail-a) timeout-per-test))
+                          (de (bounded-full-macroexpand
+                               (car tail-e) timeout-per-test)))
+                     (when (and da de
+                                (equal (normalize-variables da)
+                                       (normalize-variables de)))
+                       (setf (getf r :pass) t)
+                       (setf (getf r :upgraded) :deep-equal)
+                       (setf (car tail-s) 1.0)
+                       (incf passed))))))
+      (values results-vec passed total sim-vec))))
 
 (defun aggregate-semantic-eq (sim-scores)
   "Mean of non-NIL entries, or NIL if every entry is NIL. Returns a
@@ -421,17 +548,20 @@ a plist with :reward :passed :total :results :error :done :semantic-eq-score."
                 :semantic-eq-score (aggregate-semantic-eq sim-scores)
                 :semantic-eq-formula *ted-formula-version*)))
     (macro-gym-timeout (c)
-      (list :reward -0.1 :passed 0 :total 0 :results nil
-            :error (classify-error c)
-            :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*))
+      (let ((err (classify-error c)))
+        (list :reward (error-reward-for-type (getf err :type)) :passed 0 :total 0 :results nil
+              :error err
+              :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*)))
     (macro-gym-depth-exceeded (c)
-      (list :reward -0.1 :passed 0 :total 0 :results nil
-            :error (classify-error c)
-            :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*))
+      (let ((err (classify-error c)))
+        (list :reward (error-reward-for-type (getf err :type)) :passed 0 :total 0 :results nil
+              :error err
+              :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*)))
     (error (c)
-      (list :reward -0.1 :passed 0 :total 0 :results nil
-            :error (classify-error c)
-            :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*))))
+      (let ((err (classify-error c)))
+        (list :reward (error-reward-for-type (getf err :type)) :passed 0 :total 0 :results nil
+              :error err
+              :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*)))))
 
 ;;; ============================================================
 ;;;   Framed I/O
@@ -479,7 +609,7 @@ to signal clean shutdown."
            (macro-source (third request)))
        (unless (stringp kata-id)
          (return-from dispatch-request
-           (list :reward -0.1 :passed 0 :total 0 :results nil
+           (list :reward (error-reward-for-type "protocol-error") :passed 0 :total 0 :results nil
                  :error (list :type "protocol-error"
                               :message "kata-id must be a string"
                               :lisp-condition nil
@@ -487,7 +617,7 @@ to signal clean shutdown."
                  :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*)))
        (unless (stringp macro-source)
          (return-from dispatch-request
-           (list :reward -0.1 :passed 0 :total 0 :results nil
+           (list :reward (error-reward-for-type "protocol-error") :passed 0 :total 0 :results nil
                  :error (list :type "protocol-error"
                               :message "macro-source must be a string"
                               :lisp-condition nil
@@ -495,7 +625,7 @@ to signal clean shutdown."
                  :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*)))
        (evaluate-macro kata-id macro-source)))
     (t
-     (list :reward -0.1 :passed 0 :total 0 :results nil
+     (list :reward (error-reward-for-type "protocol-error") :passed 0 :total 0 :results nil
            :error (list :type "protocol-error"
                         :message (format nil "unknown request shape: ~s"
                                          (and (consp request) (car request)))
@@ -509,14 +639,20 @@ to signal clean shutdown."
       (format *error-output*
               "~&;; MACRO_GYM_MAX_TED_NODES override: *max-ted-nodes*=~d~%"
               override)))
+  (let ((root (init-kata-root-from-env)))
+    (when root
+      (format *error-output*
+              "~&;; MACRO_GYM_KATA_ROOT override: *kata-root*=~a~%" root)))
   (format *error-output* "~&;; macro-gym server v0.3 ready~%")
   (finish-output *error-output*)
   (loop
     (let* ((request (handler-case (read *standard-input* nil :eof)
                       (error (c)
-                        (respond (list :reward -0.1 :passed 0 :total 0 :results nil
-                                       :error (classify-error c)
-                                       :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*))
+                        (let ((err (classify-error c)))
+                          (respond (list :reward (error-reward-for-type (getf err :type))
+                                         :passed 0 :total 0 :results nil
+                                         :error err
+                                         :done nil :semantic-eq-score nil :semantic-eq-formula *ted-formula-version*)))
                         (return))))
            (response (dispatch-request request)))
       (when (eq response :exit) (return))

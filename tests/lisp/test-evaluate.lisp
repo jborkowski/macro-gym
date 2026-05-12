@@ -53,22 +53,25 @@ grader is broken."
 ;;; ---- Syntax / read errors --------------------------------------------
 
 (define-test (evaluate malformed-defmacro)
-  "Source that isn't even a defmacro -> -0.1 with error type read-error
-or evaluate-error. We accept either since 'not a defmacro form' is
-detected post-read; the contract is just 'safe, non-fatal, negative'."
+  "Source that isn't a defmacro form (defun, etc.) is the 'didn't even
+try' bucket — classified as no-defmacro with reward -0.10. This is the
+deepest negative because the rollout produced nothing the grader can
+meaningfully critique."
   (let* ((r (ev "with-logging" "(defun not-a-macro () nil)"))
          (e (err r)))
-    (is = -0.1 (reward r))
+    (is = -0.10 (reward r) "Non-defmacro is no-defmacro, reward -0.10.")
+    (is equal "no-defmacro" (getf e :type)
+        "Non-defmacro form bucket is :type 'no-defmacro'.")
     (is = 0 (passed r))
-    (true e "Error plist must be populated.")
-    (true (stringp (getf e :type)) "error :type is a string.")
     (true (stringp (getf e :message)) "error :message is a string.")))
 
 (define-test (evaluate unparseable-source)
-  "Unbalanced parens -> reader signals -> classified as read-error."
+  "Unbalanced parens -> reader signals -> classified as read-error and
+mapped to reward -0.07 (closer to working than no-defmacro). Granular
+error rewards: see ERROR-REWARD-FOR-TYPE in server.lisp."
   (let* ((r (ev "with-logging" "(defmacro foo (x"))
          (e (err r)))
-    (is = -0.1 (reward r))
+    (is = -0.07 (reward r) "Read errors map to -0.07.")
     (is equal "read-error" (getf e :type)
         "Reader errors classify as read-error.")))
 
@@ -105,7 +108,7 @@ case scores 0.0 (no passes, no error)."
 (define-test (evaluate timeout-hard-kill)
   "A defmacro whose body calls (sleep 30) during expansion must NOT hang
 the grader. The hard timeout is 5s + grace; we allow up to 8s wall
-clock as a generous CI bound."
+clock as a generous CI bound. Timeout stays at -0.10 (pathological)."
   (let* ((src "(defmacro with-logging (ctx &body body)
                  (declare (ignore ctx body))
                  (sleep 30)
@@ -114,7 +117,7 @@ clock as a generous CI bound."
          (r (ev "with-logging" src :per-test-timeout 2))
          (elapsed (/ (- (get-internal-real-time) start)
                      internal-time-units-per-second)))
-    (is = -0.1 (reward r) "Timed-out grade is the -0.1 reward.")
+    (is = -0.10 (reward r) "Timed-out grade is the -0.10 reward.")
     (true (< elapsed 8)
           (format nil "Timeout did not fire within 8s — elapsed ~,2fs." elapsed))
     (let ((e (err r)))
@@ -127,16 +130,73 @@ clock as a generous CI bound."
 (define-test (evaluate recursive-macro-depth-bound)
   "(defmacro foo () `(foo)) would loop forever inside macroexpand. The
 bounded walker must error within *max-macroexpand-depth* steps, mapping
-to reward -0.1 with a depth-exceeded error type."
+to reward -0.10 (pathological) with a depth-exceeded error type."
   (let* ((src "(defmacro with-logging (&rest args)
                  (declare (ignore args))
                  '(with-logging))")
          (r (ev "with-logging" src)))
-    (is = -0.1 (reward r))
+    (is = -0.10 (reward r))
     (let ((e (err r)))
       (true e)
       (is equal "depth-exceeded" (getf e :type)
           "Recursive macro hits the depth bound, not the timeout."))))
+
+;;; ---- Granular error reward shape (Proposal #1) ----------------------
+
+(define-test (evaluate error-reward-map-unit)
+  "ERROR-REWARD-FOR-TYPE pins the negative-side reward distribution.
+Trainers rely on these exact floats — any change here MUST coincide
+with a wire-version bump and a README reward-table update."
+  (is = -0.07 (macro-gym::error-reward-for-type "read-error"))
+  (is = -0.05 (macro-gym::error-reward-for-type "install-error"))
+  (is = -0.03 (macro-gym::error-reward-for-type "evaluate-error"))
+  (is = -0.10 (macro-gym::error-reward-for-type "timeout"))
+  (is = -0.10 (macro-gym::error-reward-for-type "depth-exceeded"))
+  (is = -0.10 (macro-gym::error-reward-for-type "no-defmacro"))
+  (is = -0.10 (macro-gym::error-reward-for-type "protocol-error"))
+  (is = -0.10 (macro-gym::error-reward-for-type "anything-unknown"))
+  (is = -0.10 (macro-gym::error-reward-for-type nil)))
+
+(define-test (evaluate bounded-full-macroexpand-walks-cons)
+  "BOUNDED-FULL-MACROEXPAND descends into cons cells, expanding nested
+macro forms recursively. Atoms pass through. The depth + timeout
+guards live inside MACROEXPAND-BOUNDED / SB-EXT:WITH-TIMEOUT — this
+test pins the structural walk."
+  (is equal '(if t 1 nil)
+      (macro-gym::bounded-full-macroexpand '(if t 1 nil) 2))
+  (is equal 42 (macro-gym::bounded-full-macroexpand 42 2))
+  ;; WHEN macroexpands to IF. After deep walk, both should be IFs.
+  (let ((deep (macro-gym::bounded-full-macroexpand '(when t (when t 1)) 2)))
+    (true (eq (car deep) 'if) "WHEN deep-expands to IF.")))
+
+(define-test (evaluate deep-equal-preserves-full-pass)
+  "The deep-equal upgrade must NEVER demote a real full-pass back to
+partial. Happy path with-logging already covered above; this asserts
+that the upgrade pass is a no-op when passed = total."
+  (let* ((src "(defmacro with-logging (ctx &body body)
+                 `(progn
+                    (log-enter ,ctx)
+                    (let ((result (progn ,@body)))
+                      (log-leave ,ctx result)
+                      result)))")
+         (r (ev "with-logging" src)))
+    (is = 1.0 (reward r))
+    (is = (total r) (passed r))
+    (dolist (test (getf r :results))
+      (false (getf test :upgraded)
+             "No :upgraded marker on already-passing tests."))))
+
+(define-test (evaluate no-defmacro-distinct-from-read-error)
+  "Trainer-side guarantee: 'didn't write defmacro' and 'wrote
+malformed defmacro' are DIFFERENT reward signals. GRPO advantage
+normalisation needs both buckets distinguishable, not collapsed to a
+single -0.1 floor."
+  (let* ((not-defmacro (ev "with-logging" "(progn 1 2 3)"))
+         (read-err (ev "with-logging" "(defmacro foo")))
+    (is = -0.10 (reward not-defmacro))
+    (is = -0.07 (reward read-err))
+    (true (/= (reward not-defmacro) (reward read-err))
+          "no-defmacro and read-error must differ — that's the entire point of #1.")))
 
 ;;; ---- install-error: undefined function in body -----------------------
 

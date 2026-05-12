@@ -194,19 +194,26 @@ def _first_fail(result):
 # 2. Bad macro
 # ----------------------------------------------------------------------------
 
-def test_unparseable_source_returns_minus_point_one(grader):
-    """Unbalanced parens → read-error, reward -0.1, no worker death."""
+def test_unparseable_source_classified_read_error(grader):
+    """Unbalanced parens → read-error, reward -0.07 under granular error
+    shaping (Proposal #1). The bucket below 'no-defmacro' / 'timeout' but
+    above 'install-error' — reader signalled, so the model came closer
+    than emitting non-defmacro shape."""
     r = grader.grade("with-logging", "(defmacro foo (")
-    assert r["reward"] == -0.1
+    assert r["reward"] == -0.07
     assert r["error"] is not None
     assert r["error"]["type"] in {"read-error", "unknown"}, r["error"]
 
 
-def test_not_a_defmacro_returns_minus_point_one(grader):
-    """`defun` instead of `defmacro` → reward -0.1."""
+def test_not_a_defmacro_classified_no_defmacro(grader):
+    """`defun` instead of `defmacro` → no-defmacro bucket, reward -0.10
+    (didn't even try). Must be distinguishable from read-error so GRPO
+    has gradient on the 'wrote nothing usable' vs 'wrote almost-right
+    syntax' axis."""
     r = grader.grade("with-logging", "(defun foo () nil)")
-    assert r["reward"] == -0.1
+    assert r["reward"] == -0.10
     assert r["error"] is not None
+    assert r["error"]["type"] == "no-defmacro"
 
 
 def test_undefined_helper_in_macro_body(grader):
