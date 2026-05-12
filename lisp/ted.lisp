@@ -42,9 +42,15 @@ positive integer; returns NIL otherwise."
           (setf *max-ted-nodes* parsed)
           parsed)))))
 
-(defparameter *ted-formula-version* "ted-zs-v1"
+(defparameter *ted-formula-version* "ted-zs-v2-err-shaped"
   "Stable wire identifier for the TED formula. Trainers' loss curves
-will encode this — bump on any algorithm or label-scheme change.")
+will encode this — bump on any algorithm or label-scheme change.
+
+v2-err-shaped: v1 algorithm unchanged; downstream reward shaping in
+server.lisp now buckets -0.1 errors into -0.03/-0.05/-0.07/-0.10 by
+error type, and rescues partial-pass rollouts via bounded-full-
+macroexpand deep-equal. The TED metric itself didn't move, but the
+sim → reward path did — bump version so wandb separates the runs.")
 
 ;;; ============================================================
 ;;;   Node label / children (s-expression view)
